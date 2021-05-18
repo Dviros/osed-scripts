@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import re
+import sys
 import argparse
 
 from rich import print
@@ -8,25 +8,9 @@ from rich.markup import escape
 from ropper import RopperService
 
 
-INSTRUCTIONS = (
-    "mov",
-    "push",
-    "pop",
-    "xchg",
-    "xor",
-    "add",
-    "sub",
-    "inc",
-    "dec",
-    "neg",
-    "jmp",
-    "call",
-    "leave",
-)
-
-
 class Gadgetizer:
-    def __init__(self, files, badbytes, output):
+    def __init__(self, files, badbytes, output, arch):
+        self.arch = arch
         self.files = files
         self.output = output
         self.badbytes = "".join(
@@ -34,40 +18,34 @@ class Gadgetizer:
         )  # ropper's badbytes option has to be an instance of str
         self.ropper_svc = self.get_ropper_service()
 
-    @staticmethod
-    def prettify(gadget):
-        # things like dword ptr [eax] need to be escaped for rich's markup
-        escaped = escape(str(gadget))
-        escaped = re.sub(r"(0x[0-9a-fA-F]+(?!\]))", r"[blue]\1[/]", escaped)
-        escaped = escaped.replace(f"ret", f"[red]ret[/]")
-
-        for instr in INSTRUCTIONS:
-            escaped = escaped.replace(
-                f" {instr}", f" [steel_blue1]{instr}[/]"
-            )
-
-        return escaped
-
     def get_ropper_service(self):
         # not all options need to be given
         options = {
-            "color": False,
+            "color": True,
             "badbytes": self.badbytes,
-            "type": "rop",  # rop, jop, sys, all; default: all
+            "type": "rop",
         }  # if gadgets are printed, use detailed output; default: False
 
         rs = RopperService(options)
-        for file in self.files:
-            rs.addFile(file, arch="x86")
-            # rs.setImageBaseFor(file, 0x1100000)
 
-        rs.loadGadgetsFor()
+        for file in self.files:
+            if ":" in file:
+                file, base = file.split(":")
+                rs.addFile(file, arch=self.arch)
+                rs.clearCache()
+                rs.setImageBaseFor(name=file, imagebase=int(base, 16))
+            else:
+                rs.addFile(file, arch=self.arch)
+                rs.clearCache()
+
+            rs.loadGadgetsFor(file)
 
         return rs
 
     def get_gadgets(self, search_str, quality=1, strict=False):
         gadgets = [
-            g for _, g in self.ropper_svc.search(search=search_str, quality=quality)
+            (f, g)
+            for f, g in self.ropper_svc.search(search=search_str, quality=quality)
         ]  # could be memory hog
 
         if not gadgets and quality < self.ropper_svc.options.inst_count and not strict:
@@ -81,15 +59,21 @@ class Gadgetizer:
         tree = Tree(title)
 
         for search_str in search_strs:
-            for gadget in self.get_gadgets(search_str):
-                pretty = Gadgetizer.prettify(gadget)
-                tree.add(pretty)
+            for file, gadget in self.get_gadgets(search_str):
+                tree.add(f"{escape(str(gadget))} :: {file}")
 
         return tree
 
     def add_gadgets_to_tree(self, tree):
         zeroize_strs = []
-        eip_to_esp_strs = ["jmp esp;", "leave;", "mov esp, ???;", "call esp;"]
+        reg_prefix = "e" if self.arch == "x86" else "r"
+
+        eip_to_esp_strs = [
+            f"jmp {reg_prefix}sp;",
+            "leave;",
+            f"mov {reg_prefix}sp, ???;",
+            f"call {reg_prefix}sp;",
+        ]
 
         tree.add(self._search_gadget("write-what-where", ["mov [???], ???;"]))
         tree.add(self._search_gadget("pointer deref", ["mov ???, [???];"]))
@@ -101,40 +85,66 @@ class Gadgetizer:
         )
         tree.add(self._search_gadget("increment register", ["inc ???;"]))
         tree.add(self._search_gadget("decrement register", ["dec ???;"]))
-        tree.add(self._search_gadget("add register", ["add ???, e??;"]))
-        tree.add(self._search_gadget("subtract register", ["sub ???, e??;"]))
-        tree.add(self._search_gadget("negate register", ["neg e??;"]))
-        tree.add(self._search_gadget("pop", ["pop e??;"]))
-        tree.add(self._search_gadget("push-pop", ["sub eax, ecx;"]))
+        tree.add(self._search_gadget("add register", [f"add ???, {reg_prefix}??;"]))
+        tree.add(
+            self._search_gadget("subtract register", [f"sub ???, {reg_prefix}??;"])
+        )
+        tree.add(self._search_gadget("negate register", [f"neg {reg_prefix}??;"]))
+        tree.add(self._search_gadget("push", [f"push {reg_prefix}??;"]))
+        tree.add(self._search_gadget("pop", [f"pop {reg_prefix}??;"]))
+        tree.add(
+            self._search_gadget(
+                "push-pop", [f"push {reg_prefix}??;.*pop {reg_prefix}??;*"]
+            )
+        )
 
-        for reg in ["eax", "ebx", "ecx", "edx", "esi", "edi"]:
+        for reg in [
+            f"{reg_prefix}ax",
+            f"{reg_prefix}bx",
+            f"{reg_prefix}cx",
+            f"{reg_prefix}dx",
+            f"{reg_prefix}si",
+            f"{reg_prefix}di",
+        ]:
             zeroize_strs.append(f"xor {reg}, {reg};")
             zeroize_strs.append(f"sub {reg}, {reg};")
             zeroize_strs.append(f"lea [{reg}], 0;")
             zeroize_strs.append(f"mov {reg}, 0;")
             zeroize_strs.append(f"and {reg}, 0;")
-            eip_to_esp_strs.append(f"xchg esp, {reg}; jmp {reg};")
-            eip_to_esp_strs.append(f"xchg esp, {reg}; call {reg};")
+            eip_to_esp_strs.append(f"xchg {reg_prefix}sp, {reg}; jmp {reg};")
+            eip_to_esp_strs.append(f"xchg {reg_prefix}sp, {reg}; call {reg};")
 
         tree.add(self._search_gadget("zeroize", zeroize_strs))
         tree.add(self._search_gadget("eip to esp", eip_to_esp_strs))
 
     def save(self):
-        with open(self.output, 'w') as f:
+        self.ropper_svc.options.color = False
+
+        with open(self.output, "w") as f:
             for file in self.files:
+                if ":" in file:
+                    file = file.split(":")[0]
+
                 for gadget in self.ropper_svc.getFileFor(name=file).gadgets:
-                    f.write(f'{gadget}\n')
+                    f.write(f"{gadget}\n")
 
 
 def main(args):
-    g = Gadgetizer(args.files, args.bad_chars, args.output)
+    g = Gadgetizer(args.files, args.bad_chars, args.output, args.arch)
 
-    tree = Tree('[bright_green][+][/bright_green] Categorized gadgets')
+    tree = Tree(
+        f'[bright_green][+][/bright_green] Categorized gadgets :: {" ".join(sys.argv)}'
+    )
     g.add_gadgets_to_tree(tree)
 
     print(tree)
 
-    print(f'[bright_green][+][/bright_green] Collection of all gadgets written to [bright_blue]{args.output}[/bright_blue]')
+    with open(f"{g.output}.clean", "w") as f:
+        print(tree, file=f)
+
+    print(
+        f"[bright_green][+][/bright_green] Collection of all gadgets written to [bright_blue]{args.output}[/bright_blue]"
+    )
     g.save()
 
 
@@ -146,7 +156,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--files",
-        help="space separated list of files from which to pull gadgets",
+        help="space separated list of files from which to pull gadgets (optionally, add base address (libspp.dll:0x10000000))",
         required=True,
         nargs="+",
     )
@@ -157,7 +167,19 @@ if __name__ == "__main__":
         default=["00"],
         nargs="+",
     )
-    parser.add_argument('-o', '--output', help='name of output file where all (uncategorized) gadgets are written (default: found-gadgets.txt)', default='found-gadgets.txt')
+    parser.add_argument(
+        "-a",
+        "--arch",
+        choices=["x86", "x86_64"],
+        help="architecture of the given file (default: x86)",
+        default="x86",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="name of output file where all (uncategorized) gadgets are written (default: found-gadgets.txt)",
+        default="found-gadgets.txt",
+    )
 
     args = parser.parse_args()
 
