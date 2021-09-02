@@ -8,8 +8,11 @@ bespoke tooling for offensive security's Windows Usermode Exploit Dev course (OS
     - [find-gadgets.py](#find-gadgetspy)
     - [shellcoder.py](#shellcoderpy)
     - [install-mona.sh](#install-monash)
+    - [attach-process.ps1](#attach-processps1)
 - [WinDbg Scripts](#windbg-scripts)
     - [find-ppr.py](#find-pprpy)
+    - [find-bad-chars.py](#find-bad-charspy)
+    - [search.py](#searchpy)
 
 ## Standalone Scripts
 ### Installation:
@@ -74,6 +77,11 @@ egghunter = b"\xeb\x2a\x59\xb8\x63\x30\x64\x33\x51\x6a\xff\x31\xdb\x64\x89\x23\x
 Finds and categorizes useful gadgets. Only prints to terminal the cleanest gadgets available (minimal amount of garbage between what's searched for and the final ret instruction).  All gadgets are written to a text file for further searching.
 
 requires [rich](https://github.com/willmcgugan/rich) and [ropper](https://github.com/sashs/Ropper)
+
+
+> today (3 june 2021) i found that ropper (and also ROPGadget) fail to find a gadget that rp++ finds (this led me to have a hard time with challenge #2, as there was an add gadget that ropper simply didn't see). 
+
+> Since find-gadgets uses the ropper api, I updated find-gadgets to also pull in rp++ gadgets. Currently, the rp++ gadgets that ropper didn't find are added to the 'all gadgets' file (found-gadgets.txt by default), and aren't categorized in the 'clean gadgets' file (found-gadgets.txt.clean by default). So, the coverage is there, just not well integrated. I may or may not revisit it and get the rp++ output categorized as well.
 
 ```text
 usage: find-gadgets.py [-h] -f FILES [FILES ...] [-b BAD_CHARS [BAD_CHARS ...]] [-o OUTPUT]
@@ -169,25 +177,194 @@ Clipboard(error): xclip_handle_SelectionNotify(), unable to find a textual targe
 
 ```
 
+### attach-process.ps1
+
+Credit to discord user @SilverStr for the inspiration! 
+
+One-shot script to perform the following actions:
+- start a given service (if `-service-name` is provided)
+- start a given executable path (if `-path` is provided)
+- start windbg and attach to the given process
+- run windbg commands after attaching (if `-commands` is provided)
+- restart a given service when windbg exits (if `-service-name` is provided)
+
+The values for `-service-name`, `-process-name`, and `-path` are tab-completable.
+
+```
+.\attach-process.ps1 -service-name fastbackserver -process-name fastbackserver -commands '.load pykd; bp fastbackserver!recvfrom'
+```
+
+```
+\\tsclient\shared\osed-scripts\attach-process.ps1 -service-name 'Sync Breeze Enterprise' -process-name syncbrs
+```
+
+```
+ \\tsclient\share\osed-scripts\attach-process.ps1 -path C:\Windows\System32\notepad.exe -process-name notepad                       
+ ```
+
+This script can be run inside a while loop for maximum laziness! Also, you can do things like `g` to start the process, followed by commands you'd like to run once the next break is hit. 
+
+```
+while ($true) {\\tsclient\shared\osed-scripts\attach-process.ps1 -process-name PROCESS_NAME -commands '.load pykd; bp SOME_ADDRESS; g; !exchain' ;}
+```
+
+Below, the process will load pykd, set a breakpoint (let's assume a pop-pop-ret gadget) and then resume execution. Once it hits the first access violation, it will run `!exchain` and then `g` to allow execution to proceed until it hits PPR gadget, after which it steps thrice using `p`, bringing EIP to the instruction directly following the pop-pop-ret. 
+
+```
+while ($true) {\\tsclient\shared\osed-scripts\attach-process.ps1 -process-name PROCESS_NAME -commands '.load pykd; bp PPR_ADDRESS; g; !exchain; g; p; p; p;' ;}
+```
+
 ## WinDbg Scripts
 
 all windbg scripts require `pykd`
 
-run `.load pykd` then `!py c:\path\to\this\repo\script.py` 
+run `.load pykd` then `!py c:\path\to\this\repo\script.py`
+
+Alternatively, you can put the scripts in `C:\python37\scripts` so they execute as `!py SCRIPT_NAME`. 
+
+Also, using `attach-process.ps1` you can add `-commands '.load pykd; g'` to always have pykd available.
 
 ### find-ppr.py
 
-Search for `pop r32; pop r32; ret` instructions by module name
+Credit to @netspooky for the rewrite of this script! 
+
+Search for `pop r32; pop r32; ret` instructions by module name. By default it only shows usable addresses without bad chars defined in the BADCHARS list on line 6.
+Printed next to the gadgets is an escaped little endian address for pasting into your shellcode.
+
+    0:000> !py find-ppr_ns.py -b 00 0A 0D -m libspp libsync
+    [+] searching libsync for pop r32; pop r32; ret
+    [+] BADCHARS: \x00\x0A\x0D
+    [+] libsync: Found 0 usable gadgets!
+    [+] searching libspp for pop r32; pop r32; ret
+    [+] BADCHARS: \x00\x0A\x0D
+    [OK] libspp::0x101582b0: pop eax; pop ebx; ret ; \xB0\x82\x15\x10
+    [OK] libspp::0x1001bc5a: pop ebx; pop ecx; ret ; \x5A\xBC\x01\x10
+    ...
+    [OK] libspp::0x10150e27: pop edi; pop esi; ret ; \x27\x0E\x15\x10
+    [OK] libspp::0x10150fc8: pop edi; pop esi; ret ; \xC8\x0F\x15\x10
+    [OK] libspp::0x10151820: pop edi; pop esi; ret ; \x20\x18\x15\x10
+    [+] libspp: Found 316 usable gadgets!
+    
+    ---- STATS ----
+    >> BADCHARS: \x00\x0A\x0D
+    >> Usable Gadgets Found: 316
+    >> Module Gadget Counts
+       - libsync: 0 
+       - libspp: 316 
+    Done!
+
+Show all gadgets with the `-s` flag. 
+
+    0:000> !py find-ppr_ns.py -b 00 0A 0D -m libspp libsync -s
+    [+] searching libsync for pop r32; pop r32; ret
+    [+] BADCHARS: \x00\x0A\x0D
+    [--] libsync::0x0096add0: pop eax; pop ebx; ret ; \xD0\xAD\x96\x00
+    [--] libsync::0x00914784: pop ebx; pop ecx; ret ; \x84\x47\x91\x00
+    ...
+    [OK] libspp::0x10150e27: pop edi; pop esi; ret ; \x27\x0E\x15\x10
+    [OK] libspp::0x10150fc8: pop edi; pop esi; ret ; \xC8\x0F\x15\x10
+    [OK] libspp::0x10151820: pop edi; pop esi; ret ; \x20\x18\x15\x10
+    [+] libspp: Found 316 usable gadgets!
+    
+    ---- STATS ----
+    >> BADCHARS: \x00\x0A\x0D
+    >> Usable Gadgets Found: 316
+    >> Module Gadget Counts
+       - libsync: 0 
+       - libspp: 316 
+    Done!
+
+### find-bad-chars.py
+
+Performs two primary actions:
+- `--generate` prints a byte string useful for inclusion in python source code
+- `--address` iterates over the given memory address and compares it with the bytes generated with the given constraints
 
 ```
-!py find-ppr.py libspp diskpls
+usage: find-bad-chars.py [-h] [-s START] [-e END] [-b BAD [BAD ...]]
+                         (-a ADDRESS | -g)
 
-[+] diskpls::0x004313ad: pop ecx; pop ecx; ret
-[+] diskpls::0x004313e3: pop ecx; pop ecx; ret
-[+] diskpls::0x00417af6: pop ebx; pop ecx; ret
+optional arguments:
+  -h, --help            show this help message and exit
+  -s START, --start START
+                        hex byte from which to start searching in memory
+                        (default: 00)
+  -e END, --end END     last hex byte to search for in memory (default: ff)
+  -b BAD [BAD ...], --bad BAD [BAD ...]
+                        space separated list of hex bytes that are already
+                        known bad (ex: -b 00 0a 0d)
+  -a ADDRESS, --address ADDRESS
+                        address from which to begin character comparison
+  -g, --generate        generate a byte string suitable for use in source code
+```
+
+#### --address example
+```
+0:008> !py find-bad-chars.py --address esp+1 --bad 1d --start 1 --end 7f
+0185ff55  01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 
+          01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 
+0185ff65  11 12 13 14 15 16 17 18 19 1A 1B 1C 1E 1F 20 21 
+          11 12 13 14 15 16 17 18 19 1A 1B 1C 1E 1F 20 21 
+0185ff75  22 23 24 25 00 00 FA 00 00 00 00 94 FF 85 01 F4 
+          22 23 24 25 -- -- -- -- -- -- -- -- -- -- -- -- 
+0185ff85  96 92 75 00 00 00 00 D0 96 92 75 E2 19 C1 58 DC 
+          -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- 
+0185ff95  FF 85 01 AF 4A 98 77 00 00 00 00 2B C9 03 8C 00 
+          -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
 ...
-[+] libspp::0x1008a538: pop ebx; pop ecx; ret
-[+] libspp::0x1008ae39: pop ebx; pop ecx; ret
-[+] libspp::0x1008aebf: pop ebx; pop ecx; ret
+```
+#### --generate example
+```
+0:008> !py find-bad-chars.py --generate --bad 1d --start 1
+[+] characters as a range of bytes
+chars = bytes(i for i in range(1, 256) if i not in [1D])
+
+[+] characters as a byte string
+chars  = b'\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10'
+chars += b'\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1E\x1F\x20\x21'
+chars += b'\x22\x23\x24\x25\x26\x27\x28\x29\x2A\x2B\x2C\x2D\x2E\x2F\x30\x31'
+chars += b'\x32\x33\x34\x35\x36\x37\x38\x39\x3A\x3B\x3C\x3D\x3E\x3F\x40\x41'
+chars += b'\x42\x43\x44\x45\x46\x47\x48\x49\x4A\x4B\x4C\x4D\x4E\x4F\x50\x51'
+chars += b'\x52\x53\x54\x55\x56\x57\x58\x59\x5A\x5B\x5C\x5D\x5E\x5F\x60\x61'
+chars += b'\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F\x70\x71'
+chars += b'\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x7B\x7C\x7D\x7E\x7F\x80\x81'
+chars += b'\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91'
+chars += b'\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F\xA0\xA1'
+chars += b'\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF\xB0\xB1'
+chars += b'\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF\xC0\xC1'
+chars += b'\xC2\xC3\xC4\xC5\xC6\xC7\xC8\xC9\xCA\xCB\xCC\xCD\xCE\xCF\xD0\xD1'
+chars += b'\xD2\xD3\xD4\xD5\xD6\xD7\xD8\xD9\xDA\xDB\xDC\xDD\xDE\xDF\xE0\xE1'
+chars += b'\xE2\xE3\xE4\xE5\xE6\xE7\xE8\xE9\xEA\xEB\xEC\xED\xEE\xEF\xF0\xF1'
+chars += b'\xF2\xF3\xF4\xF5\xF6\xF7\xF8\xF9\xFA\xFB\xFC\xFD\xFE\xFF'
+```
+
+### search.py
+
+just a wrapper around the stupid windbg search syntax
+```
+usage: search.py [-h] [-t {byte,ascii,unicode}] pattern
+
+Searches memory for the given search term
+
+positional arguments:
+  pattern               what you want to search for
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -t {byte,ascii,unicode}, --type {byte,ascii,unicode}
+                        data type to search for (default: byte)
+```
+```
+!py \\tsclient\shared\osed-scripts\search.py -t ascii fafd
+[=] running s -a 0 L?80000000 fafd
+[*] No results returned
+```
+```
+!py \\tsclient\shared\osed-scripts\search.py -t ascii ffff
+[=] running s -a 0 L?80000000 ffff
+0071290e  66 66 66 66 3a 31 32 37-2e 30 2e 30 2e 31 00 00  ffff:127.0.0.1..
+00717c5c  66 66 66 66 48 48 48 48-03 03 03 03 f6 f6 f6 f6  ffffHHHH........
+00718ddc  66 66 66 66 28 28 28 28-d9 d9 d9 d9 24 24 24 24  ffff((((....$$$$
+01763892  66 66 66 66 66 66 66 66-66 66 66 66 66 66 66 66  ffffffffffffffff
 ...
 ```
